@@ -20,6 +20,10 @@ struct Args {
     #[arg(short, long)]
     file: String,
 
+    /// The output file
+    #[arg(short, long)]
+    output: String,
+
     /// The dylibs to install
     #[arg(short, long)]
     adds: Vec<String>,
@@ -55,7 +59,7 @@ fn main() -> anyhow::Result<()> {
 
     let macho_data = install_dylibs(macho_data, &args.adds)?;
 
-    std::fs::write("g:\\dms.bin", macho_data)?;
+    std::fs::write(&args.output, macho_data)?;
 
     Ok(())
 }
@@ -155,21 +159,48 @@ fn install_dylibs(mut macho_data: Vec<u8>, dylibs: &Vec<String>) -> anyhow::Resu
         }
 
         let all_bytes = cursor.into_inner();
-
-        if lc_free_space < all_bytes.len() {
+        let cmds_size = all_bytes.len();
+        if lc_free_space < cmds_size {
             return Err(anyhow::Error::msg(format!(
                 "Not enough Load Command free space, need={}, got={}",
-                all_bytes.len(),
-                lc_free_space
+                cmds_size, lc_free_space
             )));
         }
 
-        // modify LoadCommand
-        let cmds_size = all_bytes.len();
-        modifications.push(MachOModification {
-            offset: macho_arch.offset + header_size + macho_arch.macho.header.sizeofcmds as usize,
-            data: all_bytes,
-        });
+        let lc_codesign = macho_arch
+            .macho
+            .load_commands
+            .iter()
+            .find(|lc| match lc.command {
+                goblin::mach::load_command::CommandVariant::CodeSignature(_) => true,
+                _ => false,
+            });
+
+        match lc_codesign {
+            Some(lc) => {
+                // move codesign data
+                let move_len =
+                    (header_size + macho_arch.macho.header.sizeofcmds as usize) - lc.offset;
+                modifications.push(MachOModification {
+                    offset: macho_arch.offset + cmds_size + lc.offset as usize,
+                    data: macho_arch.data[lc.offset..][..move_len].to_vec(),
+                });
+
+                // add load dylib command
+                modifications.push(MachOModification {
+                    offset: macho_arch.offset + lc.offset as usize,
+                    data: all_bytes,
+                });
+            }
+            None => {
+                modifications.push(MachOModification {
+                    offset: macho_arch.offset
+                        + header_size
+                        + macho_arch.macho.header.sizeofcmds as usize,
+                    data: all_bytes,
+                });
+            }
+        }
 
         // modify header
         let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
@@ -185,7 +216,7 @@ fn install_dylibs(mut macho_data: Vec<u8>, dylibs: &Vec<String>) -> anyhow::Resu
 
     for m in modifications {
         macho_data[m.offset..][..m.data.len()].copy_from_slice(&m.data);
-    } 
+    }
 
     Ok(macho_data)
 }
