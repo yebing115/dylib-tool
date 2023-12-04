@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::io::Write;
 
 use anyhow::Context;
+use anyhow::Ok;
 use clap::Parser;
 use goblin::mach::header;
 use goblin::mach::load_command::Dylib;
@@ -10,6 +12,7 @@ use goblin::mach::parse_magic_and_ctx;
 use goblin::mach::Mach;
 use goblin::mach::MachO;
 use goblin::mach::SingleArch;
+use scroll::Pread;
 use scroll::{ctx::SizeWith, IOwrite};
 
 /// Simple program to greet a person
@@ -55,24 +58,33 @@ pub struct MachOModification {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    let mut dels = HashSet::new();
+    for d in args.dels {
+        dels.insert(d);
+    }
+
+    let mut adds = HashSet::new();
+    for a in args.adds {
+        adds.insert(a);
+    }
+
     let macho_data = std::fs::read(&args.file)?;
-
-    let macho_data = install_dylibs(macho_data, &args.adds)?;
-
+    let macho_data = uninstall_dylibs(macho_data, &dels)?;
+    let macho_data = install_dylibs(macho_data, &adds)?;
     std::fs::write(&args.output, macho_data)?;
 
     Ok(())
 }
 
-fn install_dylibs(mut macho_data: Vec<u8>, dylibs: &Vec<String>) -> anyhow::Result<Vec<u8>> {
-    let mach = Mach::parse(&macho_data)?;
+fn parse_macho<'a>(macho_data: &'a [u8]) -> anyhow::Result<Vec<MachOInfo<'a>>> {
+    let mach = Mach::parse(macho_data)?;
 
-    let machos = match mach {
-        Mach::Binary(macho) => vec![MachOInfo {
+    match mach {
+        Mach::Binary(macho) => Ok(vec![MachOInfo {
             macho: macho,
             offset: 0,
-            data: &macho_data,
-        }],
+            data: macho_data,
+        }]),
         Mach::Fat(multiarch) => {
             let mut machos = vec![];
 
@@ -85,13 +97,21 @@ fn install_dylibs(mut macho_data: Vec<u8>, dylibs: &Vec<String>) -> anyhow::Resu
                 machos.push(MachOInfo {
                     macho: macho,
                     offset: arch.offset as usize,
-                    data: arch.slice(&macho_data),
+                    data: arch.slice(macho_data),
                 });
             }
 
-            machos
+            Ok(machos)
         }
-    };
+    }
+}
+
+fn install_dylibs(mut macho_data: Vec<u8>, dylibs: &HashSet<String>) -> anyhow::Result<Vec<u8>> {
+    if dylibs.is_empty() {
+        return Ok(macho_data);
+    }
+
+    let machos = parse_macho(&macho_data)?;
 
     let mut modifications = Vec::new();
 
@@ -207,6 +227,95 @@ fn install_dylibs(mut macho_data: Vec<u8>, dylibs: &Vec<String>) -> anyhow::Resu
         let mut header = macho_arch.macho.header;
         header.ncmds += dylibs.len();
         header.sizeofcmds += cmds_size as u32;
+        cursor.iowrite_with(header, ctx)?;
+        modifications.push(MachOModification {
+            offset: macho_arch.offset,
+            data: cursor.into_inner(),
+        });
+    }
+
+    for m in modifications {
+        macho_data[m.offset..][..m.data.len()].copy_from_slice(&m.data);
+    }
+
+    Ok(macho_data)
+}
+
+fn uninstall_dylibs(mut macho_data: Vec<u8>, dylibs: &HashSet<String>) -> anyhow::Result<Vec<u8>> {
+    if dylibs.is_empty() {
+        return Ok(macho_data);
+    }
+
+    let machos = parse_macho(&macho_data)?;
+
+    let mut modifications = Vec::new();
+
+    for macho_arch in machos {
+        let ctx = parse_magic_and_ctx(macho_arch.data, 0)?
+            .1
+            .expect("context should have been parsed before");
+
+        let header_size = header::Header::size_with(&ctx);
+
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        let mut ncmds = 0;
+        for lc in &macho_arch.macho.load_commands {
+            match &lc.command {
+                goblin::mach::load_command::CommandVariant::LoadDylib(ld) => {
+                    let name = macho_arch
+                        .data
+                        .pread::<&str>(lc.offset + ld.dylib.name as usize)?;
+                    if !dylibs.contains(name) {
+                        cursor.write(&macho_arch.data[lc.offset..][..lc.command.cmdsize()])?;
+                        ncmds += 1;
+                    }
+                }
+                goblin::mach::load_command::CommandVariant::LoadWeakDylib(lwd) => {
+                    let name = macho_arch
+                        .data
+                        .pread::<&str>(lc.offset + lwd.dylib.name as usize)?;
+                    if !dylibs.contains(name) {
+                        cursor.write(&macho_arch.data[lc.offset..][..lc.command.cmdsize()])?;
+                        ncmds += 1;
+                    }
+                }
+                goblin::mach::load_command::CommandVariant::LoadUpwardDylib(lud) => {
+                    let name = macho_arch
+                        .data
+                        .pread::<&str>(lc.offset + lud.dylib.name as usize)?;
+                    if !dylibs.contains(name) {
+                        cursor.write(&macho_arch.data[lc.offset..][..lc.command.cmdsize()])?;
+                        ncmds += 1;
+                    }
+                }
+                c => {
+                    cursor.write(&macho_arch.data[lc.offset..][..c.cmdsize()])?;
+                    ncmds += 1;
+                }
+            }
+        }
+
+        // clear old cmds
+        let mut zeroes = Vec::with_capacity(macho_arch.macho.header.sizeofcmds as usize);
+        zeroes.resize(macho_arch.macho.header.sizeofcmds as usize, 0);
+        modifications.push(MachOModification {
+            offset: macho_arch.offset + header_size,
+            data: zeroes,
+        });
+
+        // copy new cmds
+        let cmds_bytes = cursor.into_inner();
+        let cmds_size = cmds_bytes.len();
+        modifications.push(MachOModification {
+            offset: macho_arch.offset + header_size,
+            data: cmds_bytes,
+        });
+
+        // modify header
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        let mut header = macho_arch.macho.header;
+        header.ncmds = ncmds;
+        header.sizeofcmds = cmds_size as u32;
         cursor.iowrite_with(header, ctx)?;
         modifications.push(MachOModification {
             offset: macho_arch.offset,
