@@ -2,18 +2,9 @@ use std::collections::HashSet;
 use std::io::Write;
 
 use anyhow::Context;
-use anyhow::Ok;
 use clap::Parser;
-use goblin::mach::header;
-use goblin::mach::load_command::Dylib;
-use goblin::mach::load_command::DylibCommand;
-use goblin::mach::load_command::LC_LOAD_DYLIB;
-use goblin::mach::parse_magic_and_ctx;
-use goblin::mach::Mach;
-use goblin::mach::MachO;
-use goblin::mach::SingleArch;
-use scroll::Pread;
-use scroll::{ctx::SizeWith, IOwrite};
+use goblin::mach::{header, load_command, parse_magic_and_ctx, Mach, MachO, SingleArch};
+use scroll::{ctx::SizeWith, IOwrite, Pread};
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -165,10 +156,10 @@ fn install_dylibs(macho_data: &mut Vec<u8>, dylibs: &HashSet<String>) -> anyhow:
             name.extend_from_slice(name_bytes);
             name.resize(total, 0);
 
-            let lc = DylibCommand {
-                cmd: LC_LOAD_DYLIB,
+            let lc = load_command::DylibCommand {
+                cmd: load_command::LC_LOAD_DYLIB,
                 cmdsize: 0x18 + name.len() as u32,
-                dylib: Dylib {
+                dylib: load_command::Dylib {
                     name: 0x18,
                     timestamp: 2,
                     current_version: 0,
