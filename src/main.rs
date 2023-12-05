@@ -276,11 +276,9 @@ fn uninstall_dylibs(macho_data: &mut Vec<u8>, dylibs: &HashSet<String>) -> anyho
         }
 
         // clear old cmds
-        let mut zeroes = Vec::with_capacity(old_header.sizeofcmds as usize);
-        zeroes.resize(old_header.sizeofcmds as usize, 0);
         modifications.push(MachOModification {
             offset: macho_arch.offset + header_size,
-            data: zeroes,
+            data: b"\0".repeat(old_header.sizeofcmds as usize),
         });
 
         // copy new cmds
